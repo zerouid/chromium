@@ -1,0 +1,36 @@
+# Chromium Build Configuration for macOS ARM64
+# All codecs enabled with Google API keys
+
+# Build type configuration
+is_debug = false
+is_official_build = true
+dcheck_always_on = false
+is_component_build = false
+
+# Codec and media configuration
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+enable_widevine = true
+enable_webrtc = true
+enable_platform_ac3_eac3_audio = true
+enable_mse_mpeg2ts_stream_parser = true
+
+# Platform configuration
+target_os = "mac"
+target_cpu = "arm64"
+
+# Debug and symbol configuration
+symbol_level = 0
+blink_symbol_level = 0
+enable_iterator_debugging = false
+
+# Compiler and runtime configuration
+is_clang = true
+enable_rust = true
+enable_swiftshader = true
+enable_updater = false
+fatal_linker_warnings = false
+use_sysroot = false
+
+# Google API Keys (injected via build script)
+# These are set from GitHub Secrets during the build
