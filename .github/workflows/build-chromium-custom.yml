@@ -193,7 +193,7 @@ jobs:
           body: |
             **Custom Chromium Build for macOS ARM64**
             
-            Build Date: ${{ github.event.head_commit.timestamp || now() }}
+            Build Date: ${{ github.event.head_commit.timestamp }}
             Commit: ${{ github.sha }}
             
             **Features Enabled:**
