@@ -1,0 +1,226 @@
+name: Build Custom Chromium for macOS ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (debug or release)'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - debug
+          - release
+  push:
+    branches: [ main ]
+    paths:
+      - 'args.gn'
+      - '.github/workflows/build-chromium-custom.yml'
+
+concurrency:
+  group: chromium-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest-xlarge
+    timeout-minutes: 480  # 8 hours
+    
+    env:
+      DEPOT_TOOLS_UPDATE: 0
+      PATH_ADDITION: ${{ github.workspace }}/depot_tools
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      - name: Check disk space
+        run: |
+          echo "=== Disk Space Available ==="
+          df -h
+          echo ""
+          echo "=== Free up space ==="
+          # Remove Xcode simulators
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches
+          # Remove large packages
+          brew remove --ignore-dependencies node && brew cleanup
+          df -h
+      
+      - name: Cache depot_tools
+        id: cache-depot-tools
+        uses: actions/cache@v3
+        with:
+          path: depot_tools
+          key: ${{ runner.os }}-depot-tools-${{ hashFiles('.git/HEAD') }}
+          restore-keys: |
+            ${{ runner.os }}-depot-tools-
+      
+      - name: Install depot_tools
+        if: steps.cache-depot-tools.outputs.cache-hit != 'true'
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "Depot tools installed"
+      
+      - name: Cache Chromium source
+        id: cache-chromium-src
+        uses: actions/cache@v3
+        with:
+          path: src
+          key: ${{ runner.os }}-chromium-src-${{ github.ref }}-${{ hashFiles('.git/HEAD') }}
+          restore-keys: |
+            ${{ runner.os }}-chromium-src-${{ github.ref }}-
+            ${{ runner.os }}-chromium-src-
+      
+      - name: Fetch Chromium source
+        if: steps.cache-chromium-src.outputs.cache-hit != 'true'
+        run: |
+          export PATH="${PATH_ADDITION}:${PATH}"
+          echo "Fetching Chromium source (this may take 30-60 minutes)..."
+          timeout 3600 fetch --nohooks chromium || echo "Fetch timeout or failed - will attempt sync"
+          if [ -d "src" ]; then
+            echo "Source directory exists"
+          fi
+      
+      - name: Sync Chromium source
+        run: |
+          export PATH="${PATH_ADDITION}:${PATH}"
+          if [ -d "src" ]; then
+            cd src
+            echo "Syncing Chromium source..."
+            git fetch origin main --depth=1
+            git checkout origin/main
+            gclient sync --with_branch_heads -n
+          else
+            echo "Source not found, attempting fetch again..."
+            fetch --nohooks chromium
+          fi
+      
+      - name: Install build dependencies
+        run: |
+          cd src
+          echo "Installing build dependencies..."
+          # The build/install-build-deps.sh handles most dependencies
+          if [ -f build/install-build-deps-mac.sh ]; then
+            sudo build/install-build-deps-mac.sh
+          fi
+      
+      - name: Generate build configuration with API keys
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_DEFAULT_CLIENT_ID: ${{ secrets.GOOGLE_DEFAULT_CLIENT_ID }}
+          GOOGLE_DEFAULT_CLIENT_SECRET: ${{ secrets.GOOGLE_DEFAULT_CLIENT_SECRET }}
+        run: |
+          export PATH="${PATH_ADDITION}:${PATH}"
+          
+          # Create output directory
+          mkdir -p src/out/arm64
+          
+          # Copy base args.gn
+          cp args.gn src/out/arm64/args.gn
+          
+          # Append API keys if they're set (they should be for proper Google API functionality)
+          if [ -n "$GOOGLE_API_KEY" ] && [ "$GOOGLE_API_KEY" != "" ]; then
+            echo "google_api_key = \"$GOOGLE_API_KEY\"" >> src/out/arm64/args.gn
+          else
+            echo "WARNING: GOOGLE_API_KEY not set - some Google services may not work"
+            echo "google_api_key = \"\"" >> src/out/arm64/args.gn
+          fi
+          
+          if [ -n "$GOOGLE_DEFAULT_CLIENT_ID" ] && [ "$GOOGLE_DEFAULT_CLIENT_ID" != "" ]; then
+            echo "google_default_client_id = \"$GOOGLE_DEFAULT_CLIENT_ID\"" >> src/out/arm64/args.gn
+          fi
+          
+          if [ -n "$GOOGLE_DEFAULT_CLIENT_SECRET" ] && [ "$GOOGLE_DEFAULT_CLIENT_SECRET" != "" ]; then
+            echo "google_default_client_secret = \"$GOOGLE_DEFAULT_CLIENT_SECRET\"" >> src/out/arm64/args.gn
+          fi
+          
+          echo ""
+          echo "=== Generated args.gn ==="
+          cat src/out/arm64/args.gn
+      
+      - name: Generate build files with GN
+        run: |
+          export PATH="${PATH_ADDITION}:${PATH}"
+          cd src
+          echo "Generating Ninja build files..."
+          gn gen out/arm64 --args-file=out/arm64/args.gn
+      
+      - name: Build Chromium
+        run: |
+          export PATH="${PATH_ADDITION}:${PATH}"
+          cd src
+          
+          # Get number of available cores
+          CORES=$(sysctl -n hw.ncpu)
+          echo "Building with $CORES cores..."
+          
+          # Start the build with ninja
+          ninja -C out/arm64 -j$CORES chrome
+      
+      - name: Verify build artifacts
+        run: |
+          if [ -d "src/out/arm64/Chromium.app" ]; then
+            echo "✓ Chromium.app built successfully"
+            du -sh src/out/arm64/Chromium.app
+          else
+            echo "✗ Build failed - Chromium.app not found"
+            exit 1
+          fi
+      
+      - name: Create build artifact archive
+        run: |
+          cd src/out/arm64
+          tar -czf ../../../chromium-macos-arm64-$(date +%Y%m%d-%H%M%S).tar.gz Chromium.app
+          ls -lh ../../../chromium-macos-arm64-*.tar.gz
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        if: success()
+        with:
+          name: chromium-macos-arm64-build
+          path: chromium-macos-arm64-*.tar.gz
+          retention-days: 30
+          compression-level: 0
+      
+      - name: Create release
+        if: success()
+        uses: softprops/action-gh-release@v1
+        with:
+          files: chromium-macos-arm64-*.tar.gz
+          tag_name: chromium-build-${{ github.run_number }}
+          body: |
+            **Custom Chromium Build for macOS ARM64**
+            
+            Build Date: ${{ github.event.head_commit.timestamp || now() }}
+            Commit: ${{ github.sha }}
+            
+            **Features Enabled:**
+            - All proprietary codecs
+            - Widevine support
+            - WebRTC
+            - Platform AC3/EAC3 audio
+            - MSE MPEG2TS stream parser
+            - SwiftShader
+            - Rust support
+            
+            **Build Configuration:**
+            - Target: macOS ARM64 (Apple Silicon)
+            - Build Type: Release/Optimized
+            - Symbol Level: 0 (Optimized for size)
+            - Updater: Disabled
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build summary
+        if: always()
+        run: |
+          echo "=== Build Summary ==="
+          echo "Status: ${{ job.status }}"
+          echo "Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          echo "Disk usage:"
+          du -sh src/out/arm64/
