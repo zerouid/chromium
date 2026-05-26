@@ -163,7 +163,8 @@ jobs:
           echo "Building with $CORES cores (limited for free tier)..."
           
           # Build with reduced parallelism
-          ninja -C out/arm64 -j$CORES -l$((CORES + 1)) chrome 2>&1 | grep -E "(LINK|ERROR|warning:|Built target)"
+          # ninja -C out/arm64 -j$CORES -l$((CORES + 1)) chrome 2>&1 | grep -E "(LINK|ERROR|warning:|Built target)"
+          ninja -C out/arm64 -j$CORES -l$((CORES + 1)) chrome > build.log 2>&1 || (tail -n 100 build.log && exit 1)
       
       - name: Verify build artifacts
         run: |
