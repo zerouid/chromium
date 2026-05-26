@@ -23,12 +23,13 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-latest-xlarge
-    timeout-minutes: 480  # 8 hours
+    runs-on: macos-latest
+    timeout-minutes: 360  # 6 hours (free tier limit)
     
     env:
       DEPOT_TOOLS_UPDATE: 0
       PATH_ADDITION: ${{ github.workspace }}/depot_tools
+      NINJA_STATUS: "[%f/%t] %es"
     
     steps:
       - name: Checkout repository
@@ -42,10 +43,12 @@ jobs:
           df -h
           echo ""
           echo "=== Free up space ==="
-          # Remove Xcode simulators
+          # Remove Xcode simulators and caches
           sudo rm -rf /Library/Developer/CoreSimulator/Caches
+          sudo rm -rf /Library/Caches/pip
+          sudo rm -rf /Users/runner/Library/Caches/pip
           # Remove large packages
-          brew remove --ignore-dependencies node && brew cleanup
+          brew remove --ignore-dependencies node openjdk && brew cleanup
           df -h
       
       - name: Cache depot_tools
@@ -53,57 +56,63 @@ jobs:
         uses: actions/cache@v3
         with:
           path: depot_tools
-          key: ${{ runner.os }}-depot-tools-${{ hashFiles('.git/HEAD') }}
+          key: ${{ runner.os }}-depot-tools-v1
           restore-keys: |
             ${{ runner.os }}-depot-tools-
       
       - name: Install depot_tools
         if: steps.cache-depot-tools.outputs.cache-hit != 'true'
         run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
           echo "Depot tools installed"
       
-      - name: Cache Chromium source
-        id: cache-chromium-src
-        uses: actions/cache@v3
-        with:
-          path: src
-          key: ${{ runner.os }}-chromium-src-${{ github.ref }}-${{ hashFiles('.git/HEAD') }}
-          restore-keys: |
-            ${{ runner.os }}-chromium-src-${{ github.ref }}-
-            ${{ runner.os }}-chromium-src-
+      - name: Check for cached Chromium source
+        id: check-src-cache
+        run: |
+          if [ -d "src/.git" ]; then
+            echo "cache-exists=true" >> $GITHUB_OUTPUT
+            echo "Found cached source directory"
+          else
+            echo "cache-exists=false" >> $GITHUB_OUTPUT
+          fi
       
       - name: Fetch Chromium source
-        if: steps.cache-chromium-src.outputs.cache-hit != 'true'
+        if: steps.check-src-cache.outputs.cache-exists == 'false'
         run: |
           export PATH="${PATH_ADDITION}:${PATH}"
-          echo "Fetching Chromium source (this may take 30-60 minutes)..."
-          timeout 3600 fetch --nohooks chromium || echo "Fetch timeout or failed - will attempt sync"
+          echo "Fetching Chromium source..."
+          # Use --no-history to reduce bandwidth
+          fetch --nohooks --no-history chromium 2>&1 | tail -20
           if [ -d "src" ]; then
-            echo "Source directory exists"
+            echo "✓ Source directory created"
           fi
       
       - name: Sync Chromium source
         run: |
           export PATH="${PATH_ADDITION}:${PATH}"
+          if [ ! -d "src" ]; then
+            echo "Source directory not found, attempting fresh fetch..."
+            fetch --nohooks --no-history chromium 2>&1 | tail -20
+          fi
+          
           if [ -d "src" ]; then
             cd src
             echo "Syncing Chromium source..."
             git fetch origin main --depth=1
-            git checkout origin/main
-            gclient sync --with_branch_heads -n
-          else
-            echo "Source not found, attempting fetch again..."
-            fetch --nohooks chromium
+            git checkout -q origin/main
+            # Minimal sync - only what's needed for ARM64 build
+            gclient sync -n 2>&1 | tail -20
           fi
       
       - name: Install build dependencies
         run: |
-          cd src
-          echo "Installing build dependencies..."
-          # The build/install-build-deps.sh handles most dependencies
-          if [ -f build/install-build-deps-mac.sh ]; then
-            sudo build/install-build-deps-mac.sh
+          if [ -d "src" ]; then
+            cd src
+            echo "Checking for macOS build dependencies..."
+            # Only install if the script exists
+            if [ -f build/install-build-deps-mac.sh ]; then
+              sudo bash build/install-build-deps-mac.sh --no-prompt --no-backwards-compat 2>&1 | tail -20 || true
+            fi
           fi
       
       - name: Generate build configuration with API keys
@@ -114,17 +123,13 @@ jobs:
         run: |
           export PATH="${PATH_ADDITION}:${PATH}"
           
-          # Create output directory
           mkdir -p src/out/arm64
-          
-          # Copy base args.gn
           cp args.gn src/out/arm64/args.gn
           
-          # Append API keys if they're set (they should be for proper Google API functionality)
+          # Add API keys only if set
           if [ -n "$GOOGLE_API_KEY" ] && [ "$GOOGLE_API_KEY" != "" ]; then
             echo "google_api_key = \"$GOOGLE_API_KEY\"" >> src/out/arm64/args.gn
           else
-            echo "WARNING: GOOGLE_API_KEY not set - some Google services may not work"
             echo "google_api_key = \"\"" >> src/out/arm64/args.gn
           fi
           
@@ -145,19 +150,20 @@ jobs:
           export PATH="${PATH_ADDITION}:${PATH}"
           cd src
           echo "Generating Ninja build files..."
-          gn gen out/arm64 --args-file=out/arm64/args.gn
+          gn gen out/arm64 --args-file=out/arm64/args.gn 2>&1 | tail -20
       
       - name: Build Chromium
         run: |
           export PATH="${PATH_ADDITION}:${PATH}"
           cd src
           
-          # Get number of available cores
+          # Use fewer cores for free tier (limit to 4)
           CORES=$(sysctl -n hw.ncpu)
-          echo "Building with $CORES cores..."
+          CORES=$((CORES > 4 ? 4 : CORES))
+          echo "Building with $CORES cores (limited for free tier)..."
           
-          # Start the build with ninja
-          ninja -C out/arm64 -j$CORES chrome
+          # Build with reduced parallelism
+          ninja -C out/arm64 -j$CORES -l$((CORES + 1)) chrome 2>&1 | grep -E "(LINK|ERROR|warning:|Built target)"
       
       - name: Verify build artifacts
         run: |
@@ -166,13 +172,20 @@ jobs:
             du -sh src/out/arm64/Chromium.app
           else
             echo "✗ Build failed - Chromium.app not found"
+            ls -la src/out/arm64/ | head -20
             exit 1
           fi
       
-      - name: Create build artifact archive
+      - name: Create build artifact archive (stripped)
         run: |
           cd src/out/arm64
-          tar -czf ../../../chromium-macos-arm64-$(date +%Y%m%d-%H%M%S).tar.gz Chromium.app
+          echo "Creating compressed archive..."
+          # Strip unnecessary files before archiving
+          find Chromium.app -name "*.dSYM" -exec rm -rf {} + 2>/dev/null || true
+          find Chromium.app -name "*test*" -type f -delete 2>/dev/null || true
+          
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          tar -czf ../../../chromium-macos-arm64-${TIMESTAMP}.tar.gz Chromium.app
           ls -lh ../../../chromium-macos-arm64-*.tar.gz
       
       - name: Upload build artifacts
@@ -181,7 +194,7 @@ jobs:
         with:
           name: chromium-macos-arm64-build
           path: chromium-macos-arm64-*.tar.gz
-          retention-days: 30
+          retention-days: 7
           compression-level: 0
       
       - name: Create release
@@ -222,5 +235,5 @@ jobs:
           echo "Status: ${{ job.status }}"
           echo "Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo ""
-          echo "Disk usage:"
-          du -sh src/out/arm64/
+          echo "Disk usage (src directory):"
+          du -sh src/ 2>/dev/null || echo "N/A"
