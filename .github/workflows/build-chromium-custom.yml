@@ -156,6 +156,8 @@ jobs:
         run: |
           export PATH="${PATH_ADDITION}:${PATH}"
           cd src
+
+          gn gen out/arm64
           
           # Use fewer cores for free tier (limit to 4)
           CORES=$(sysctl -n hw.ncpu)
